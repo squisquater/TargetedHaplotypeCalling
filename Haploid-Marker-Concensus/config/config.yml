@@ -1,0 +1,22 @@
+out_dir: "/path/to/output_directory"
+sample_sheet: "/path/to/sample_sheet.tsv"
+
+marker:
+  name: "12S"
+  fasta: "/path/to/marker_reference.fa"
+
+  bbduk:
+    k: 23
+    hdist: 2
+    minlen: 30
+    threads: 8
+
+  bwa_threads: 8
+
+  map:
+    bwa_mem_k: 11
+
+  mpileup:
+    max_depth: 100000
+    minMQ: 0
+    minBQ: 0
