@@ -1,0 +1,409 @@
+# ============================================
+# Standalone haploid marker alignment mini-pipeline (generic)
+# - Input: sample sheet TSV with columns: sample, r1, r2 (sex optional)
+# - Config: marker: { name, fasta, bbduk{}, bwa_threads }
+# - Steps: bbduk bait -> bwa mem -> depth QC -> bcftools consensus (HAPLOID ONLY)
+# - Outputs per sample:
+#     02_map/{sample}.{marker}.bam(+.bai)
+#     03_consensus/{sample}.{marker}.vcf.gz(+.csi)
+#     03_consensus/{sample}.{marker}.consensus.fa
+#     05_qc/{sample}.{marker}.mean_depth.txt
+#     05_qc/{sample}.{marker}.zero_cov.bed
+# - Outputs aggregate:
+#     05_qc/{marker}.depth_summary.tsv
+#     03_consensus/{marker}.merged_with_reference.fa
+# ============================================
+
+configfile: "./config/config.yml"
+
+import os, csv
+from pathlib import Path
+
+# -----------------------
+# Load config
+# -----------------------
+OUT_DIR = config.get("out_dir", "marker_mini")
+M       = config.get("marker", {})
+MARKER_NAME  = M.get("name", None)
+MARKER_FASTA = M.get("fasta", None)
+
+if not MARKER_NAME:
+    raise ValueError("config['marker']['name'] must be set (e.g., 'SRY', '12S', 'mtGenome')")
+if not MARKER_FASTA:
+    raise ValueError("config['marker']['fasta'] must be set (path to marker reference FASTA)")
+
+# HAPLOID ONLY:
+PLOIDY = 1
+
+# Tool params
+BBDUK      = M.get("bbduk", {"k": 23, "hdist": 2, "minlen": 30, "threads": 8})
+KMER       = int(BBDUK.get("k", 23))
+HDIST      = int(BBDUK.get("hdist", 2))
+MINLEN     = int(BBDUK.get("minlen", 30))
+THREADS    = int(BBDUK.get("threads", 8))
+BWA_THREADS = int(M.get("bwa_threads", THREADS))
+
+# optional mapping params
+MAP        = M.get("map", {})
+BWA_MEM_K  = int(MAP.get("bwa_mem_k", 11))
+
+# optional mpileup params
+MPILEUP      = M.get("mpileup", {})
+MPILEUP_MAXD = int(MPILEUP.get("max_depth", 100000))
+MPILEUP_MINMQ = int(MPILEUP.get("minMQ", 0))
+MPILEUP_MINBQ = int(MPILEUP.get("minBQ", 0))
+
+SAMPLE_SHEET = config.get("sample_sheet", None)
+if not SAMPLE_SHEET:
+    raise ValueError("config['sample_sheet'] must point to a TSV with columns: sample, r1, r2 (sex optional)")
+
+# -----------------------
+# Layout (no mkdir at parse-time; rules mkdir -p as needed)
+# -----------------------
+ROOT      = Path(OUT_DIR)
+BAIT_DIR  = ROOT / "01_bait"
+MAP_DIR   = ROOT / "02_map"
+CONS_DIR  = ROOT / "03_consensus"
+QC_DIR    = ROOT / "05_qc"
+LISTS_DIR = ROOT / "fastq_lists"
+
+# -----------------------
+# Parse sample sheet
+# -----------------------
+SAMPLES = []
+SHEET_ROWS = {}   # sample -> dict(row)
+
+with open(SAMPLE_SHEET, "rt") as f:
+    rdr = csv.DictReader(f, delimiter="\t")
+    for row in rdr:
+        for req in ("sample", "r1", "r2"):
+            if req not in row or not row[req]:
+                raise ValueError(f"Missing '{req}' in sample sheet row: {row}")
+
+        s = row["sample"].strip()
+        if not s:
+            raise ValueError(f"Empty sample name in row: {row}")
+
+        SAMPLES.append(s)
+        SHEET_ROWS[s] = {
+            "sex": (row.get("sex", "NA") or "NA").strip(),
+            "r1": row["r1"].strip(),
+            "r2": row["r2"].strip(),
+        }
+
+SAMPLES = sorted(set(SAMPLES))
+
+# -----------------------
+# Helpers
+# -----------------------
+def r1_list(wc):
+    return str(LISTS_DIR / f"{wc.sample}.R1.list")
+
+def r2_list(wc):
+    return str(LISTS_DIR / f"{wc.sample}.R2.list")
+
+def bbduk_stats_path(sample):
+    return str(BAIT_DIR / f"{sample}.{MARKER_NAME}.bbduk.stats.txt")
+
+# -----------------------
+# Targets
+# -----------------------
+rule all:
+    input:
+        # per-sample
+        expand(str(MAP_DIR / "{{s}}.{}.bam".format(MARKER_NAME)), s=SAMPLES),
+        expand(str(MAP_DIR / "{{s}}.{}.bam.bai".format(MARKER_NAME)), s=SAMPLES),
+        expand(str(CONS_DIR / "{{s}}.{}.vcf.gz".format(MARKER_NAME)), s=SAMPLES),
+        expand(str(CONS_DIR / "{{s}}.{}.vcf.gz.csi".format(MARKER_NAME)), s=SAMPLES),
+        expand(str(CONS_DIR / "{{s}}.{}.consensus.fa".format(MARKER_NAME)), s=SAMPLES),
+        expand(str(QC_DIR / "{{s}}.{}.mean_depth.txt".format(MARKER_NAME)), s=SAMPLES),
+        expand(str(QC_DIR / "{{s}}.{}.zero_cov.bed".format(MARKER_NAME)), s=SAMPLES),
+        # aggregate
+        str(QC_DIR / f"{MARKER_NAME}.depth_summary.tsv"),
+        str(CONS_DIR / f"{MARKER_NAME}.merged_with_reference.fa"),
+
+# -----------------------
+# Marker validation / index
+# -----------------------
+rule validate_marker:
+    resources:
+        mem_mb = 5 * 1024,
+        time = 120,
+        partition = "bml"
+    input:
+        MARKER_FASTA
+    output:
+        flag = str(ROOT / f"marker.validated.{MARKER_NAME}.flag")
+    run:
+        if (not os.path.exists(input[0])) or os.path.getsize(input[0]) == 0:
+            raise FileNotFoundError(f"Marker FASTA missing or empty: {input[0]}")
+        with open(input[0], "rt") as h:
+            first = h.readline().strip()
+            if not first.startswith(">"):
+                raise ValueError(f"Marker FASTA does not look like FASTA (missing '>'): {input[0]}")
+        Path(output.flag).parent.mkdir(parents=True, exist_ok=True)
+        Path(output.flag).write_text("OK\n")
+
+rule index_marker:
+    resources:
+        mem_mb = 5 * 1024,
+        time = 120,
+        partition = "bml"
+    input:
+        flag  = str(ROOT / f"marker.validated.{MARKER_NAME}.flag"),
+        fasta = MARKER_FASTA
+    output:
+        idx = MARKER_FASTA + ".bwt"
+    conda:
+        "envs/align.yml"     # bwa available here
+    shell:
+        r"""
+        set -euo pipefail
+        bwa index {input.fasta}
+        """
+
+# -----------------------
+# Write per-sample list files (for bbduk)
+# -----------------------
+rule write_lists:
+    resources:
+        mem_mb = 1024,
+        time = 60,
+        partition = "bml"
+    input:
+        sheet = SAMPLE_SHEET
+    output:
+        r1 = str(LISTS_DIR / "{sample}.R1.list"),
+        r2 = str(LISTS_DIR / "{sample}.R2.list")
+    run:
+        s = wildcards.sample
+        row = SHEET_ROWS[s]
+        Path(LISTS_DIR).mkdir(parents=True, exist_ok=True)
+        Path(output.r1).write_text(row["r1"] + "\n")
+        Path(output.r2).write_text(row["r2"] + "\n")
+
+# -----------------------
+# BBDUK baiting
+# -----------------------
+rule marker_bbduk_bait:
+    resources:
+        mem_mb = 5 * 1024,
+        time = 120,
+        partition = "bml"
+    input:
+        marker  = MARKER_FASTA,
+        idxflag = str(ROOT / f"marker.validated.{MARKER_NAME}.flag"),
+        r1list  = r1_list,
+        r2list  = r2_list
+    output:
+        r1    = temp(str(BAIT_DIR / f"{{sample}}.{MARKER_NAME}.R1.fq.gz")),
+        r2    = temp(str(BAIT_DIR / f"{{sample}}.{MARKER_NAME}.R2.fq.gz")),
+        stats = str(BAIT_DIR / f"{{sample}}.{MARKER_NAME}.bbduk.stats.txt")
+    params:
+        k       = KMER,
+        hdist   = HDIST,
+        minlen  = MINLEN,
+        threads = THREADS
+    conda:
+        "envs/bbduk.yml"     # bbduk.sh here
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {BAIT_DIR}
+        R1=$(cat {input.r1list})
+        R2=$(cat {input.r2list})
+        bbduk.sh in1=$R1 in2=$R2 \
+                 outm1={output.r1} outm2={output.r2} \
+                 ref={input.marker} k={params.k} hdist={params.hdist} minlen={params.minlen} \
+                 stats={output.stats} threads={params.threads} overwrite=t
+        """
+
+# -----------------------
+# Map baited reads
+# -----------------------
+rule map_baited_reads:
+    resources:
+        mem_mb = 5 * 1024,
+        time = 120,
+        partition = "bml"
+    input:
+        idx = MARKER_FASTA + ".bwt",
+        r1  = str(BAIT_DIR / f"{{sample}}.{MARKER_NAME}.R1.fq.gz"),
+        r2  = str(BAIT_DIR / f"{{sample}}.{MARKER_NAME}.R2.fq.gz"),
+        ref = MARKER_FASTA
+    output:
+        bam = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam"),
+        bai = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam.bai")
+    conda:
+        "envs/align.yml"     # bwa + samtools
+    threads:
+        BWA_THREADS
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {MAP_DIR}
+        bwa mem -k {BWA_MEM_K} -t {threads} {input.ref} {input.r1} {input.r2} \
+          | samtools sort -@ {threads} -o {output.bam}
+        samtools index {output.bam}
+        """
+
+# -----------------------
+# Mean depth QC on marker
+# -----------------------
+rule mean_depth_on_marker:
+    resources:
+        mem_mb = 1024,
+        time = 60,
+        partition = "bml"
+    input:
+        bam = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam"),
+        bai = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam.bai")
+    output:
+        md  = str(QC_DIR / f"{{sample}}.{MARKER_NAME}.mean_depth.txt")
+    conda:
+        "envs/align.yml"     # samtools
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {QC_DIR}
+        samtools depth -a {input.bam} \
+          | awk '{{sum+=$3; n++}} END{{if(n>0) printf("%.6f\n", sum/n); else print 0}}' > {output.md}
+        """
+
+# -----------------------
+# Zero-coverage mask as BED (only positions with depth==0)
+# -----------------------
+rule zero_coverage_bed:
+    resources:
+        mem_mb = 512,
+        time = 30,
+        partition = "bml"
+    input:
+        bam = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam"),
+        bai = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam.bai")
+    output:
+        bed = str(QC_DIR / f"{{sample}}.{MARKER_NAME}.zero_cov.bed")
+    conda:
+        "envs/align.yml"   # samtools
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {QC_DIR}
+        # samtools depth -aa emits all ref positions; output 0-based, half-open BED for depth==0
+        samtools depth -aa {input.bam} \
+          | awk '$3==0 {{print $1"\t"$2-1"\t"$2}}' > {output.bed}
+        """
+
+# -----------------------
+# Consensus per sample (HAPLOID ONLY)
+# -----------------------
+rule marker_consensus:
+    resources:
+        mem_mb = 5 * 1024,
+        time = 180,
+        partition = "bml"
+    input:
+        bam  = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam"),
+        bai  = str(MAP_DIR / f"{{sample}}.{MARKER_NAME}.bam.bai"),
+        ref  = MARKER_FASTA,
+        mask = str(QC_DIR / f"{{sample}}.{MARKER_NAME}.zero_cov.bed")
+    output:
+        vcf    = str(CONS_DIR / f"{{sample}}.{MARKER_NAME}.vcf.gz"),
+        vcfidx = str(CONS_DIR / f"{{sample}}.{MARKER_NAME}.vcf.gz.csi"),
+        fa     = str(CONS_DIR / f"{{sample}}.{MARKER_NAME}.consensus.fa")
+    conda:
+        "envs/bcftools.yml"
+    threads:
+        BWA_THREADS
+    params:
+        ploidy = PLOIDY,
+        maxd   = MPILEUP_MAXD,
+        minmq  = MPILEUP_MINMQ,
+        minbq  = MPILEUP_MINBQ
+    shell:
+        r"""
+        set -euo pipefail
+        mkdir -p {CONS_DIR}
+
+        bcftools mpileup -f {input.ref} -A -B \
+                         -q {params.minmq} -Q {params.minbq} -d {params.maxd} \
+                         -Ou -a FORMAT/DP,AD,ADF,ADR {input.bam} \
+        | bcftools call -m -v --ploidy {params.ploidy} --keep-alts -Oz -o {output.vcf}
+
+        bcftools index -f -o {output.vcfidx} {output.vcf}
+
+        # Mask only zero-coverage sites to N; otherwise covered ref stays ref; variants override ref.
+        # -H 1 is appropriate for haploid (and keeps behavior stable).
+        bcftools consensus -H 1 -f {input.ref} -m {input.mask} {output.vcf} \
+          | sed "s/^>.*/>{wildcards.sample}/" > {output.fa}
+        """
+
+# -----------------------
+# Aggregate summary
+# -----------------------
+rule marker_summary:
+    resources:
+        mem_mb = 1024,
+        time = 60,
+        partition = "bml"
+    input:
+        md    = expand(str(QC_DIR / "{{s}}.{}.mean_depth.txt".format(MARKER_NAME)), s=SAMPLES),
+        fa    = expand(str(CONS_DIR / "{{s}}.{}.consensus.fa".format(MARKER_NAME)), s=SAMPLES),
+        stats = expand(str(BAIT_DIR / "{{s}}.{}.bbduk.stats.txt".format(MARKER_NAME)), s=SAMPLES)
+    output:
+        table = str(QC_DIR / f"{MARKER_NAME}.depth_summary.tsv")
+    run:
+        # Parse bbduk stats (best-effort; formats vary)
+        kept = {}
+        for s in SAMPLES:
+            p = BAIT_DIR / f"{s}.{MARKER_NAME}.bbduk.stats.txt"
+            kval = "NA"
+            if p.exists():
+                with p.open("rt") as fh:
+                    for line in fh:
+                        t = line.strip()
+                        if t.lower().startswith("result:"):
+                            kval = t.split(":", 1)[1].strip()
+                        elif t.lower().startswith("output:") and "reads" in t.lower():
+                            kval = t
+            kept[s] = kval
+
+        # Mean depths
+        mdict = {}
+        for s in SAMPLES:
+            p = QC_DIR / f"{s}.{MARKER_NAME}.mean_depth.txt"
+            mdict[s] = p.read_text().strip() if p.exists() else "NA"
+
+        # Write summary (sex optional)
+        Path(QC_DIR).mkdir(parents=True, exist_ok=True)
+        with open(output.table, "wt") as out:
+            out.write("sample\tsex\tmean_depth_on_marker\tbbduk_summary\tconsensus_fa\n")
+            for s in SAMPLES:
+                sex = SHEET_ROWS[s].get("sex", "NA")
+                fa  = CONS_DIR / f"{s}.{MARKER_NAME}.consensus.fa"
+                out.write(f"{s}\t{sex}\t{mdict.get(s,'NA')}\t{kept.get(s,'NA')}\t{fa}\n")
+
+# -----------------------
+# Merge all consensus FASTAs + reference into one file
+# -----------------------
+rule merge_reference_and_consensus:
+    resources:
+        mem_mb = 1024,
+        time = 30,
+        partition = "bml"
+    input:
+        ref  = MARKER_FASTA,
+        cons = expand(str(CONS_DIR / "{{s}}.{}.consensus.fa".format(MARKER_NAME)), s=SAMPLES)
+    output:
+        merged = str(CONS_DIR / f"{MARKER_NAME}.merged_with_reference.fa")
+    run:
+        Path(CONS_DIR).mkdir(parents=True, exist_ok=True)
+        with open(output.merged, "wt") as out:
+            # Reference first
+            with open(input.ref, "rt") as ref_in:
+                out.write(ref_in.read().rstrip("\n") + "\n")
+            # Then each consensus
+            for f in input.cons:
+                out.write("\n")
+                with open(f, "rt") as cons_in:
+                    out.write(cons_in.read().rstrip("\n") + "\n")
